@@ -242,5 +242,16 @@ def get_apply_rope_func(model="llama"):
 
         return wrapper
 
+    elif model == "llama4":
+
+        def wrapper(q, k, freqs_cis, **kwargs):
+            # freqs_cis: complex polar [batch, seq, head_dim//2]
+            # Llama 4 q/k are in paired layout no interleaved shuffle needed (unlike DeepSeek)
+            cos = freqs_cis.real  # [batch, seq, head_dim//2]
+            sin = freqs_cis.imag  # [batch, seq, head_dim//2]
+            return apply_rope_base(q, k, cos, sin)
+
+        return wrapper
+
     else:
         raise ValueError(f"Unsupported model: {model}")

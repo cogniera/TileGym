@@ -7,16 +7,16 @@ import pathlib
 
 import pytest
 
-try:
-    import torch
-except ImportError:
-    raise ImportError(
-        "\n\n[TileGym] PyTorch is required to run this library.\n"
-        "Since CUDA versions vary significantly across devices, please "
-        "manually install the version that matches your hardware:\n"
-        "👉 https://pytorch.org/get-started/locally/\n"
-        "Alternatively, try: pip install tilegym[torch]\n"
-    ) from None
+# try:
+#     import torch
+# except ImportError:
+#     raise ImportError(
+#         "\n\n[TileGym] PyTorch is required to run this library.\n"
+#         "Since CUDA versions vary significantly across devices, please "
+#         "manually install the version that matches your hardware:\n"
+#         "👉 https://pytorch.org/get-started/locally/\n"
+#         "Alternatively, try: pip install tilegym[torch]\n"
+#     ) from None
 
 
 def pytest_configure(config):
