@@ -66,7 +66,8 @@ def test_llama4_moe_correctness():
     tg.shared_expert.up_proj.weight.data.copy_(ref.shared_expert.up_proj.weight.data)
     tg.shared_expert.down_proj.weight.data.copy_(ref.shared_expert.down_proj.weight.data)
 
-    x = torch.randn(4, 32, config.hidden_size, device=device, dtype=dtype)
+    # Llama4TextMoe expects and returns flattened [tokens, hidden] — pass 2D input
+    x = torch.randn(4 * 32, config.hidden_size, device=device, dtype=dtype)
     with torch.no_grad():
         ref_out, _ = ref(x)
         tg_out, _ = tg(x)
@@ -97,9 +98,7 @@ def test_llama4_scout_e2e():
         intermediate_size=512,
         intermediate_size_mlp=512,
         # Scout has no MoE layers
-        num_local_experts=0,
-        num_experts_per_tok=0,
-        interleave_moe_layer_step=0,
+        moe_layers=[],
         vocab_size=512,
         max_position_embeddings=64,
     )
