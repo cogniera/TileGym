@@ -494,6 +494,55 @@ def apply_tilegym_kernel_to_olmo3(
         logger.info("Patched Olmo3DecoderLayer.forward with fused residual_add+RMSNorm")
 
 
+def apply_tilegym_kernel_to_llama4(
+    rope: bool = True,
+    rms_norm: bool = True,
+    mlp: bool = True,
+    attn: bool = True,
+    moe: bool = True,
+    model: PreTrainedModel = None,
+    use_cutile: bool = False,
+) -> None:
+    """
+    Apply TileGym kernels to replace original implementation in HuggingFace Llama 4 Scout models.
+
+    Args:
+        rope (bool): Whether to apply TileGym's rotary position embedding. Default is True.
+        rms_norm (bool): Whether to apply TileGym's RMSNorm. Default is True.
+        mlp (bool): Whether to apply TileGym's SwiGLU MLP for dense layers. Default is True.
+        attn (bool): Whether to apply TileGym's attention. Default is True.
+        moe (bool): Whether to apply TileGym's fused MoE. Default is True.
+        model (PreTrainedModel): The model instance to apply kernels to, if the model has already been
+        loaded. Default is None.
+        use_cutile (bool): Whether to apply using cutile. Default is False.
+    """
+    logger.info("--------------------------------")
+    logger.info("apply_tilegym_kernel_to_llama4")
+    logger.info("--------------------------------")
+    from transformers.models.llama4 import modeling_llama4
+
+    if use_cutile:
+        set_backend("cutile")
+
+    if rope:
+        modeling_llama4.apply_rotary_emb = get_apply_rope_func(model="llama4")
+    if rms_norm:
+        modeling_llama4.Llama4TextRMSNorm = get_rms_norm_module()
+    if mlp:
+        from tilegym.transformers.llama4.modeling_llama4 import Llama4TextMLPTileGym
+
+        modeling_llama4.Llama4TextMLP = Llama4TextMLPTileGym
+    if attn:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = get_fmha_interface()
+        ALL_ATTENTION_FUNCTIONS["eager"] = get_fmha_interface()
+    if moe:
+        from tilegym.transformers.llama4.modeling_llama4 import Llama4TextMoeTileGym
+
+        modeling_llama4.Llama4TextMoe = Llama4TextMoeTileGym
+
+
 MODEL_TYPE_TO_APPLY_TILEGYM_FN = {
     "llama": apply_tilegym_kernel_to_llama,
     "deepseek_v2": apply_tilegym_kernel_to_deepseek_v2,

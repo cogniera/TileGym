@@ -73,3 +73,51 @@ def test_llama4_moe_correctness():
 
     # 2e-2 tolerance: accounts for weight normalization difference (sigmoid vs normalized sigmoid)
     torch.testing.assert_close(tg_out, ref_out, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_llama4_scout_e2e():
+    """Full forward pass of Llama 4 Scout with TileGym patches matches vanilla output.
+
+    Uses a small random-weight Llama 4 Scout config (no MoE layers) to validate that
+    apply_tilegym_kernel_to_llama4 correctly patches all components end-to-end.
+    Scout has no MoE — all layers are dense TextMLP layers.
+    """
+    import copy
+
+    from transformers import Llama4ForCausalLM, Llama4TextConfig
+
+    from tilegym.transformers.monkey_patch import apply_tilegym_kernel_to_llama4
+
+    config = Llama4TextConfig(
+        hidden_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        intermediate_size=512,
+        intermediate_size_mlp=512,
+        # Scout has no MoE layers
+        num_local_experts=0,
+        num_experts_per_tok=0,
+        interleave_moe_layer_step=0,
+        vocab_size=512,
+        max_position_embeddings=64,
+    )
+
+    device, dtype = torch.device("cuda"), torch.bfloat16
+
+    # Build vanilla reference model
+    ref_model = Llama4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+
+    # Build patched model from same weights
+    apply_tilegym_kernel_to_llama4(moe=False)
+    patched_model = Llama4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+    patched_model.load_state_dict(copy.deepcopy(ref_model.state_dict()))
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 16), device=device)
+
+    with torch.no_grad():
+        ref_out = ref_model(input_ids).logits
+        tg_out = patched_model(input_ids).logits
+
+    torch.testing.assert_close(tg_out, ref_out, rtol=1e-2, atol=1e-2)

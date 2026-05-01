@@ -26,6 +26,7 @@ from tilegym.transformers import apply_tilegym_kernel_to_deepseek_v2
 from tilegym.transformers import apply_tilegym_kernel_to_gemma3
 from tilegym.transformers import apply_tilegym_kernel_to_gpt_oss
 from tilegym.transformers import apply_tilegym_kernel_to_llama
+from tilegym.transformers import apply_tilegym_kernel_to_llama4
 from tilegym.transformers import apply_tilegym_kernel_to_mistral
 from tilegym.transformers import apply_tilegym_kernel_to_olmo3
 from tilegym.transformers import apply_tilegym_kernel_to_phi3
@@ -259,7 +260,9 @@ def get_messages_list(args):
 
 def apply_tilegym_patch(model_id, use_attn=False, use_cutile=False):
     model_name = model_id.lower()
-    if "llama" in model_name:
+    if "llama4" in model_name or "llama-4" in model_name:
+        apply_tilegym_kernel_to_llama4(rope=True, rms_norm=True, mlp=True, attn=use_attn, moe=False, use_cutile=use_cutile)
+    elif "llama" in model_name:
         apply_tilegym_kernel_to_llama(rope=True, swiglu=True, rms_norm=True, attn=use_attn, use_cutile=use_cutile)
     elif "deepseek" in model_name:
         apply_tilegym_kernel_to_deepseek_v2(
