@@ -155,6 +155,88 @@ def apply_tilegym_kernel_to_qwen2(
         ALL_ATTENTION_FUNCTIONS["sdpa"] = get_fmha_interface()
 
 
+def apply_tilegym_kernel_to_qwen3(
+    rope: bool = True,
+    rms_norm: bool = True,
+    swiglu: bool = True,
+    attn: bool = True,
+    gated_delta_rule: bool = True,
+    model: PreTrainedModel = None,
+    use_cutile: bool = False,
+) -> None:
+    """
+    Apply TileGym kernels to replace original implementation in HuggingFace Qwen3.5 models.
+
+    Qwen3.5 is a hybrid model with both standard attention layers and gated delta rule
+    linear attention layers. This function patches both types.
+
+    Args:
+        rope (bool): Whether to apply TileGym's rotary position embedding. Default is True.
+        rms_norm (bool): Whether to apply TileGym's RMSNorm. Default is True.
+        swiglu (bool): Whether to apply TileGym's SwiGLU MLP. Default is True.
+        attn (bool): Whether to apply TileGym's attention for full attention layers. Default is True.
+        gated_delta_rule (bool): Whether to apply TileGym's gated delta rule kernels
+            for linear attention layers. Default is True.
+        model (PreTrainedModel): The model instance to apply TileGym kernels to, if the model has already been
+        loaded. Default is None.
+        use_cutile (bool): Whether to apply using cutile. Default is False.
+    """
+    logger.info("--------------------------------")
+    logger.info("apply_tilegym_kernel_to_qwen3")
+    logger.info("--------------------------------")
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    if use_cutile:
+        set_backend("cutile")
+
+    if rope:
+        from tilegym.ops import get_apply_rope_func
+
+        modeling_qwen3_5.apply_rotary_pos_emb = get_apply_rope_func(model="qwen3_5")
+    if rms_norm:
+        # Qwen3.5 uses Gemma-style RMSNorm: weights init to zeros, applied as (1 + w) * norm(x)
+        modeling_qwen3_5.Qwen3_5RMSNorm = get_rms_norm_module(model="gemma3")
+    if swiglu:
+        from tilegym.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5MLPTileGym
+
+        modeling_qwen3_5.Qwen3_5MLP = Qwen3_5MLPTileGym
+    if attn:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        from tilegym.transformers.qwen3_5.modeling_qwen3_5 import get_fmha_qwen3_5_interface
+
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = get_fmha_qwen3_5_interface()
+    if gated_delta_rule:
+        from tilegym.ops import chunk_gated_delta_rule as tilegym_chunk_gated_delta_rule
+        from tilegym.ops import recurrent_gated_delta_rule as tilegym_recurrent_gated_delta_rule
+
+        modeling_qwen3_5.chunk_gated_delta_rule = tilegym_chunk_gated_delta_rule
+        modeling_qwen3_5.fused_recurrent_gated_delta_rule = tilegym_recurrent_gated_delta_rule
+
+    if use_cutile:
+        from tilegym.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGatedTileGym
+        from tilegym.transformers.qwen3_5.modeling_qwen3_5 import _attention_forward_tilegym
+        from tilegym.transformers.qwen3_5.modeling_qwen3_5 import _gated_delta_net_forward_tilegym
+        from tilegym.transformers.qwen3_5.modeling_qwen3_5 import causal_conv1d_update_silu_cutile
+
+        # Fused causal conv1d: set module-level so GatedDeltaNet.__init__ picks it up
+        modeling_qwen3_5.causal_conv1d_update = causal_conv1d_update_silu_cutile
+
+        # Fused RMSNormGated with SiLU gate
+        modeling_qwen3_5.Qwen3_5RMSNormGated = Qwen3_5RMSNormGatedTileGym
+
+        # Patch GatedDeltaNet forward for fused gate preprocessing
+        modeling_qwen3_5.Qwen3_5GatedDeltaNet.forward = _gated_delta_net_forward_tilegym
+
+        # Patch Attention forward for fused sigmoid gate
+        modeling_qwen3_5.Qwen3_5Attention.forward = _attention_forward_tilegym
+
+        # Patch DecoderLayer forward for fused residual add + RMSNorm
+        from tilegym.transformers.qwen3_5.modeling_qwen3_5 import _decoder_layer_forward_tilegym
+
+        modeling_qwen3_5.Qwen3_5DecoderLayer.forward = _decoder_layer_forward_tilegym
+
+
 def apply_tilegym_kernel_to_gpt_oss(
     rope: bool = True,
     rms_norm: bool = True,
@@ -352,53 +434,64 @@ def apply_tilegym_kernel_to_phi3(
         ALL_ATTENTION_FUNCTIONS["sdpa"] = get_fmha_phi3_interface()
 
 
-def apply_tilegym_kernel_to_llama4(
+def apply_tilegym_kernel_to_olmo3(
     rope: bool = True,
     rms_norm: bool = True,
-    mlp: bool = True,
+    swiglu: bool = True,
     attn: bool = True,
-    moe: bool = True,
     model: PreTrainedModel = None,
     use_cutile: bool = False,
 ) -> None:
     """
-    Apply TileGym kernels to Llama 4 (Scout/Maverick) models.
+    Apply TileGym kernels to replace original implementation in HuggingFace OLMo-3 models.
+
+    OLMo-3 uses a Llama-like architecture with:
+    - Post-normalization (RMSNorm after residual addition)
+    - Q/K normalization (RMSNorm on projected Q and K before attention)
+    - SwiGLU MLP (separate gate/up/down projections with SiLU)
+    - YARN RoPE for extended context
+    - Mixed sliding window + full attention (3:1 pattern)
 
     Args:
         rope (bool): Whether to apply TileGym's rotary position embedding. Default is True.
         rms_norm (bool): Whether to apply TileGym's RMSNorm. Default is True.
-        mlp (bool): Whether to apply TileGym's fused MLP. Default is True.
-        attn (bool): Whether to register TileGym FMHA in ALL_ATTENTION_FUNCTIONS. Default is True.
-        moe (bool): Whether to apply TileGym's fused MoE. Default is True.
+        swiglu (bool): Whether to apply TileGym's SwiGLU MLP. Default is True.
+        attn (bool): Whether to apply TileGym's attention. Default is True.
         model (PreTrainedModel): The model instance to apply TileGym kernels to, if the model has already been
         loaded. Default is None.
         use_cutile (bool): Whether to apply using cutile. Default is False.
     """
     logger.info("--------------------------------")
-    logger.info("apply_tilegym_kernel_to_llama4")
+    logger.info("apply_tilegym_kernel_to_olmo3")
     logger.info("--------------------------------")
-    from transformers.models.llama4 import modeling_llama4
-
-    from tilegym.transformers.llama4.modeling_llama4 import Llama4TextMLPTileGym
-    from tilegym.transformers.llama4.modeling_llama4 import Llama4TextMoeTileGym
+    from transformers.models.olmo3 import modeling_olmo3
 
     if use_cutile:
         set_backend("cutile")
 
     if rope:
-        modeling_llama4.apply_rotary_emb = get_apply_rope_func(model="llama4")
+        modeling_olmo3.apply_rotary_pos_emb = get_apply_rope_func(model="llama")
     if rms_norm:
-        modeling_llama4.Llama4TextRMSNorm = get_rms_norm_module()
-    if mlp:
-        modeling_llama4.Llama4TextMLP = Llama4TextMLPTileGym
+        modeling_olmo3.Olmo3RMSNorm = get_rms_norm_module()
+    if swiglu:
+        modeling_olmo3.Olmo3MLP = get_fused_swiglu_module()
     if attn:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-        iface = get_fmha_interface()
-        ALL_ATTENTION_FUNCTIONS["sdpa"] = iface
-        ALL_ATTENTION_FUNCTIONS["eager"] = iface  # Llama4 may dispatch via "eager"
-    if moe:
-        modeling_llama4.Llama4TextMoe = Llama4TextMoeTileGym  # lowercase 'e' — confirmed
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = get_fmha_interface()
+
+    if use_cutile:
+        from tilegym.transformers.olmo3.modeling_olmo3 import FusedOlmo3MLP
+        from tilegym.transformers.olmo3.modeling_olmo3 import _attention_forward_tilegym
+        from tilegym.transformers.olmo3.modeling_olmo3 import _decoder_layer_forward_tilegym
+
+        if swiglu:
+            modeling_olmo3.Olmo3MLP = FusedOlmo3MLP
+            logger.info("Replaced Olmo3MLP with FusedOlmo3MLP (linear_gluact_linear)")
+        modeling_olmo3.Olmo3Attention.forward = _attention_forward_tilegym
+        logger.info("Patched Olmo3Attention.forward with fused dual Q/K RMSNorm")
+        modeling_olmo3.Olmo3DecoderLayer.forward = _decoder_layer_forward_tilegym
+        logger.info("Patched Olmo3DecoderLayer.forward with fused residual_add+RMSNorm")
 
 
 MODEL_TYPE_TO_APPLY_TILEGYM_FN = {
@@ -407,9 +500,11 @@ MODEL_TYPE_TO_APPLY_TILEGYM_FN = {
     "gpt_oss": apply_tilegym_kernel_to_gpt_oss,
     "mistral": apply_tilegym_kernel_to_mistral,
     "qwen2": apply_tilegym_kernel_to_qwen2,
+    "qwen3_5": apply_tilegym_kernel_to_qwen3,
     "gemma3": apply_tilegym_kernel_to_gemma3,
     "llama4": apply_tilegym_kernel_to_llama4,
     "phi3": apply_tilegym_kernel_to_phi3,
+    "olmo3": apply_tilegym_kernel_to_olmo3,
 }
 
 

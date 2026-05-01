@@ -3,12 +3,33 @@
 # SPDX-License-Identifier: MIT
 
 import math
+import os
+from types import SimpleNamespace
 
 import cuda.tile as ct
 import torch
 from cuda.tile._numeric_semantics import RoundingMode as RMd
+from cuda.tile.tune import exhaustive_search
 
 from tilegym.backend import register_impl
+
+# Module-level tune cache: (S_qo, TILE_D, TILE_KPE, H, query_group_size, dtype, device) -> (best_cfg, tuned_kernel)
+_mla_tune_cache: dict = {}
+
+
+def _mla_sm80_autotune_configs():
+    """Pre-SM90 autotune search space for MLA prefill — num_ctas=1 only."""
+    for tm in [64, 128]:
+        for tn in [64, 128]:
+            yield SimpleNamespace(TILE_M=tm, TILE_N=tn, num_ctas=1, occupancy=2)
+
+
+def _mla_sm90_autotune_configs():
+    """SM90+ autotune search space for MLA prefill."""
+    for tm in [64, 128, 256]:
+        for tn in [64, 128]:
+            yield SimpleNamespace(TILE_M=tm, TILE_N=tn, num_ctas=1, occupancy=1)
+
 
 # Type aliases for constants
 ConstInt = ct.Constant[int]
@@ -149,29 +170,46 @@ class _attention(torch.autograd.Function):
         else:
             assert H % num_head_kv == 0
             query_group_size = int(H / num_head_kv)
-        # Launch fmha fwd kernel
-        grid = (math.ceil(S_qo / kernel_configs.get("TILE_M", 256)), B * H, 1)
-        TILE_M = kernel_configs.get("TILE_M", 256)
-        TILE_N = kernel_configs.get("TILE_N", 128)
+        # Launch fmha fwd kernel using autotune.
+        _gpu_cap = torch.cuda.get_device_capability(q.device)
+        _configs_fn = _mla_sm80_autotune_configs if _gpu_cap[0] < 9 else _mla_sm90_autotune_configs
+        stream = torch.cuda.current_stream()
+        cache_key = (S_qo, TILE_D, TILE_KPE, H, query_group_size, q.dtype, str(q.device))
+        if cache_key not in _mla_tune_cache:
+            with ct.compiler_timeout(5):
+                result = exhaustive_search(
+                    list(_configs_fn()),
+                    stream,
+                    lambda cfg: (math.ceil(S_qo / cfg.TILE_M), B * H, 1),
+                    prefill_mla,
+                    lambda cfg: (
+                        q,
+                        qpe,
+                        k,
+                        kpe,
+                        v,
+                        o,
+                        sm_scale,
+                        TILE_D,
+                        TILE_KPE,
+                        H,
+                        cfg.TILE_M,
+                        cfg.TILE_N,
+                        query_group_size,
+                    ),
+                    lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+                )
+            best_cfg = result.best.config
+            _mla_tune_cache[cache_key] = (
+                best_cfg,
+                ct.kernel(prefill_mla._pyfunc, num_ctas=best_cfg.num_ctas, occupancy=best_cfg.occupancy),
+            )
+        best_cfg, tuned_kernel = _mla_tune_cache[cache_key]
         ct.launch(
-            torch.cuda.current_stream(),
-            grid,
-            prefill_mla,
-            (
-                q,
-                qpe,
-                k,
-                kpe,
-                v,
-                o,
-                sm_scale,
-                TILE_D,
-                TILE_KPE,
-                H,
-                TILE_M,
-                TILE_N,
-                query_group_size,
-            ),
+            stream,
+            (math.ceil(S_qo / best_cfg.TILE_M), B * H, 1),
+            tuned_kernel,
+            (q, qpe, k, kpe, v, o, sm_scale, TILE_D, TILE_KPE, H, best_cfg.TILE_M, best_cfg.TILE_N, query_group_size),
         )
         ctx.save_for_backward(q, k, v, o)
         ctx.sm_scale = sm_scale
@@ -202,18 +240,79 @@ class Attention:
         return c
 
 
+def cutile_autotune_mla(stream, q, qpe, k, kpe, v, o, sm_scale, H, query_group_size):
+    """Autotuned launch for prefill_mla kernel."""
+    B, _, S_qo, TILE_D = q.shape
+    TILE_KPE = qpe.shape[3]
+    _gpu_cap = torch.cuda.get_device_capability(q.device)
+    _configs_fn = _mla_sm80_autotune_configs if _gpu_cap[0] < 9 else _mla_sm90_autotune_configs
+    cache_key = (S_qo, TILE_D, TILE_KPE, H, query_group_size, q.dtype, str(q.device))
+
+    if os.environ.get("DISABLE_AUTOTUNE", "0") == "1":
+        cfg = next(_configs_fn())
+        ct.launch(
+            stream,
+            (math.ceil(S_qo / cfg.TILE_M), B * H, 1),
+            prefill_mla,
+            (q, qpe, k, kpe, v, o, sm_scale, TILE_D, TILE_KPE, H, cfg.TILE_M, cfg.TILE_N, query_group_size),
+        )
+        return
+
+    if cache_key not in _mla_tune_cache:
+        with ct.compiler_timeout(5):
+            result = exhaustive_search(
+                list(_configs_fn()),
+                stream,
+                lambda cfg: (math.ceil(S_qo / cfg.TILE_M), B * H, 1),
+                prefill_mla,
+                lambda cfg: (
+                    q,
+                    qpe,
+                    k,
+                    kpe,
+                    v,
+                    o,
+                    sm_scale,
+                    TILE_D,
+                    TILE_KPE,
+                    H,
+                    cfg.TILE_M,
+                    cfg.TILE_N,
+                    query_group_size,
+                ),
+                lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+            )
+        best_cfg = result.best.config
+        _mla_tune_cache[cache_key] = (
+            best_cfg,
+            ct.kernel(prefill_mla._pyfunc, num_ctas=best_cfg.num_ctas, occupancy=best_cfg.occupancy),
+        )
+    best_cfg, tuned_kernel = _mla_tune_cache[cache_key]
+    ct.launch(
+        stream,
+        (math.ceil(S_qo / best_cfg.TILE_M), B * H, 1),
+        tuned_kernel,
+        (q, qpe, k, kpe, v, o, sm_scale, TILE_D, TILE_KPE, H, best_cfg.TILE_M, best_cfg.TILE_N, query_group_size),
+    )
+
+
 def tile_mla(q, k, v, qpe, kpe, is_causal, scaling, **kwargs):
+    assert is_causal, "CuTile MLA only supports is_causal=True"
     if scaling is None:
         scaling = 1.0 / math.sqrt(q.size(-1) + qpe.size(-1))
 
-    defaults = {"TILE_M": 256, "TILE_N": 128}
-    user_cfg = kwargs.get("kernel_configs")
-    if user_cfg is None:
-        kernel_configs = defaults
+    B, H, S_qo, TILE_D = q.shape
+    num_head_kv = k.shape[1]
+    o = torch.empty_like(q)
+
+    if H == num_head_kv:
+        query_group_size = 0
     else:
-        kernel_configs = {**defaults, **user_cfg}
-    attention = Attention(is_causal, kernel_configs)
-    o = attention(q, k, v, scaling, qpe, kpe)
+        assert H % num_head_kv == 0
+        query_group_size = int(H / num_head_kv)
+
+    stream = torch.cuda.current_stream()
+    cutile_autotune_mla(stream, q, qpe, k, kpe, v, o, scaling, H, query_group_size)
     return o
 
 

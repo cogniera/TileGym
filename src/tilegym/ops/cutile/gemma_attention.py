@@ -16,11 +16,14 @@ import math
 from types import SimpleNamespace
 
 import cuda.tile as ct
-import cuda.tile_experimental as ct_experimental
 import torch
 from cuda.tile import RoundingMode as RMd
+from cuda.tile.tune import exhaustive_search
 
 from tilegym.backend import register_impl
+
+# Module-level tune cache: (B, H, S_qo, S_kv, BLOCK_D, query_group_size, stage, window_size, soft_cap_val, has_soft_cap, dtype, device) -> (best_cfg, tuned_kernel)
+_gemma_fmha_tune_cache: dict = {}
 
 # Constants
 INV_LOG_2 = 1.0 / math.log(2)
@@ -102,9 +105,7 @@ def _gemma_attn_fwd_inner(
         if HAS_SOFT_CAP:
             qk = ct.mul(qk, sm_scale, flush_to_zero=True)
             qk = ct.truediv(qk, SOFT_CAP, flush_to_zero=True, rounding_mode=RMd.APPROX)
-            # TODO: Performance will be ready once tanh approx is supported
-            # Currently using exact tanh which may impact performance
-            qk = ct.tanh(qk)
+            qk = ct.tanh(qk, rounding_mode=RMd.APPROX)
             qk = ct.mul(qk, SOFT_CAP, flush_to_zero=True)
 
             if STAGE == 2:
@@ -276,8 +277,13 @@ def gemma_fmha_kernel(
 
 def _gemma_fmha_autotune_configs():
     """Iterator of autotune configurations for gemma FMHA kernel."""
-    yield SimpleNamespace(BLOCK_M=256, BLOCK_N=128, num_ctas=1, occupancy=1)
-    yield SimpleNamespace(BLOCK_M=128, BLOCK_N=128, num_ctas=1, occupancy=2)
+    gpu_capability = torch.cuda.get_device_capability()
+    if gpu_capability[0] < 9:
+        yield SimpleNamespace(BLOCK_M=64, BLOCK_N=64, num_ctas=1, occupancy=2)
+        yield SimpleNamespace(BLOCK_M=128, BLOCK_N=64, num_ctas=1, occupancy=2)
+    else:
+        yield SimpleNamespace(BLOCK_M=256, BLOCK_N=128, num_ctas=1, occupancy=1)
+        yield SimpleNamespace(BLOCK_M=128, BLOCK_N=128, num_ctas=1, occupancy=2)
 
 
 def _cutile_autotune_gemma_fmha(
@@ -299,15 +305,64 @@ def _cutile_autotune_gemma_fmha(
     has_soft_cap,
 ):
     """Launch gemma FMHA kernel with autotune."""
-    ct_experimental.autotune_launch(
+    cache_key = (
+        B,
+        H,
+        S_qo,
+        S_kv,
+        BLOCK_D,
+        query_group_size,
+        stage,
+        window_size,
+        soft_cap_val,
+        has_soft_cap,
+        q.dtype,
+        str(q.device),
+    )
+    if cache_key not in _gemma_fmha_tune_cache:
+        with ct.compiler_timeout(5):
+            result = exhaustive_search(
+                list(_gemma_fmha_autotune_configs()),
+                stream,
+                lambda cfg: (math.ceil(S_qo / cfg.BLOCK_M), B * H, 1),
+                gemma_fmha_kernel,
+                lambda cfg: (
+                    q,
+                    k,
+                    v,
+                    o,
+                    sm_scale,
+                    B,
+                    H,
+                    S_qo,
+                    S_kv,
+                    BLOCK_D,
+                    cfg.BLOCK_M,
+                    cfg.BLOCK_N,
+                    query_group_size,
+                    stage,
+                    window_size,
+                    soft_cap_val,
+                    has_soft_cap,
+                    (S_kv % cfg.BLOCK_N) == 0,
+                ),
+                lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+            )
+        best_cfg = result.best.config
+        _gemma_fmha_tune_cache[cache_key] = (
+            best_cfg,
+            ct.kernel(
+                gemma_fmha_kernel._pyfunc,
+                num_ctas=best_cfg.num_ctas,
+                occupancy=best_cfg.occupancy,
+            ),
+        )
+    best_cfg, tuned_kernel = _gemma_fmha_tune_cache[cache_key]
+    ct.launch(
         stream,
-        grid_fn=lambda cfg: (
-            math.ceil(S_qo / cfg.BLOCK_M),
-            B * H,
-            1,
-        ),
-        kernel=gemma_fmha_kernel,
-        args_fn=lambda cfg: (
+        (math.ceil(S_qo / best_cfg.BLOCK_M), B * H, 1),
+        tuned_kernel,
+        (
             q,
             k,
             v,
@@ -318,20 +373,15 @@ def _cutile_autotune_gemma_fmha(
             S_qo,
             S_kv,
             BLOCK_D,
-            cfg.BLOCK_M,
-            cfg.BLOCK_N,
+            best_cfg.BLOCK_M,
+            best_cfg.BLOCK_N,
             query_group_size,
             stage,
             window_size,
             soft_cap_val,
             has_soft_cap,
-            (S_kv % cfg.BLOCK_N) == 0,
+            (S_kv % best_cfg.BLOCK_N) == 0,
         ),
-        hints_fn=lambda cfg: {
-            "num_ctas": cfg.num_ctas,
-            "occupancy": cfg.occupancy,
-        },
-        search_space=_gemma_fmha_autotune_configs,
     )
     return o
 
@@ -393,8 +443,9 @@ class _gemma_attention(torch.autograd.Function):
                 has_soft_cap,
             )
 
-        BLOCK_M = 128
-        BLOCK_N = 128
+        _gemma_cap = torch.cuda.get_device_capability()
+        BLOCK_M = 64 if _gemma_cap[0] < 9 else 128
+        BLOCK_N = 64 if _gemma_cap[0] < 9 else 128
         EVEN_K = (S_kv % BLOCK_N) == 0
         grid = ((S_qo + BLOCK_M - 1) // BLOCK_M, B * H, 1)
 

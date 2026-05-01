@@ -30,27 +30,36 @@ class Test_RMSNorm(common.PyTestCase):
         return weight * input
 
     _backends = ["cutile"]
+    _perf_frameworks = _backends + ["pytorch"]
 
     @pytest.mark.parametrize(
         "m, n, dtype",
         [
             (256, 256, torch.float16),
+            (256, 768, torch.float16),  # non-pow2
+            (256, 18432, torch.float16),  # non-pow2
             (4096, 2**8, torch.bfloat16),
             (31072, 4096, torch.bfloat16),
             (256, 256, torch.float32),
         ],
     )
-    @pytest.mark.parametrize("static_persistent", [True, False])
+    @pytest.mark.parametrize("mode", [None, "static_persistent", "multi_wave_reload", "multi_wave_cached"])
     @pytest.mark.parametrize("backend", _backends)
     @markif(
         lambda arch, m, n: arch in ["sm120", "sm121"] and m == 31072 and n == 4096,
         mark=pytest.mark.slow,
     )
-    def test_op(self, m, n, dtype, static_persistent, backend, arch):
+    def test_op(self, m, n, dtype, mode, backend, arch):
         if tilegym.is_backend_available(backend):
             tilegym.set_backend(backend)
         else:
             pytest.skip(f"Backend {backend} is not available")
+
+        # skip static_persistent tests when n > 16384 to avoid excessive memory usage
+        # Avoid tileiras hangs on RTX PRO 6000 which has 100 KB shared memory per SM
+        # mode=None can also select static_persistent via heuristic when M > NUM_SMS * 2
+        if mode in ("static_persistent", None) and n > 16384:
+            pytest.skip("Skipping static_persistent test for large n to avoid excessive memory usage")
 
         self.setUp()
         device = torch.device("cuda")
@@ -74,8 +83,64 @@ class Test_RMSNorm(common.PyTestCase):
                     "eps": eps,
                 },
                 extra_test_kwargs={
-                    "static_persistent": static_persistent,
+                    "mode": mode,
                 },
                 rtol=0.0,
                 atol=5e-2,
             )
+
+    @pytest.mark.parametrize(
+        "m,n,dtype",
+        [(262144, 2**i, torch.float16) for i in range(10, 13)]
+        + [(65536, 8192, torch.float16), (65536, 16384, torch.float16)],
+        ids=lambda x: str(x) if isinstance(x, list) else x.__name__ if hasattr(x, "__name__") else str(x),
+    )
+    @pytest.mark.parametrize("static_persistent", [True, False])
+    @pytest.mark.parametrize("framework", _perf_frameworks)
+    def test_perf(self, m, n, static_persistent, dtype, framework, record_property, arch):
+        if arch == "sm80":
+            pytest.skip("Skip on sm80 due to OOM.")
+        self.setUp()
+        device = torch.device("cuda")
+        eps = 1e-5
+
+        if framework == "cutile" and arch in ["sm120", "sm121"] and static_persistent == True and n == 16384:
+            pytest.skip("Cutile uses too much memory and hangs. This previously created a PTXAS Error")
+
+        x_shape = (m, n)
+        w_shape = (n,)
+        x = torch.rand(x_shape, dtype=dtype, device=device, requires_grad=True)
+        weight = torch.randn(w_shape, dtype=dtype, device=device, requires_grad=True)
+        with torch.no_grad():
+            if framework == "pytorch":
+                framework_fn = lambda: self.reference(x, w_shape, weight, eps)
+            elif tilegym.is_backend_available(framework):
+                tilegym.set_backend(framework)
+                framework_fn = lambda: tilegym.ops.rms_norm(
+                    x,
+                    w_shape,
+                    weight,
+                    eps,
+                    static_persistent=static_persistent,
+                )
+            else:
+                pytest.skip(f"Framework {framework} is not available")
+
+            # skip test for sm120, sm121 because of OOM
+            if framework != "pytorch" and torch.cuda.get_device_capability()[0] != 12:
+                self.assertCorrectness(
+                    framework_fn,
+                    lambda: self.reference(x, w_shape, weight, eps),
+                    {},
+                    rtol=0.0,
+                    atol=5e-2,
+                )
+            result = common.benchmark_framework(framework, framework_fn, use_cudagraph=True)
+            record_property("benchmark", result)
+
+            # Explicit cleanup to prevent OOM
+            del x, weight, framework_fn
+            torch.cuda.empty_cache()
+            import gc
+
+            gc.collect()

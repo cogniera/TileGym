@@ -20,6 +20,8 @@ class FromEnvironment(argparse.Action):
             default = os.environ[envvar]
             if nargs in ["+", "*"]:
                 default = default.split(",")
+            elif "type" in kwargs and kwargs["type"] is bool:
+                default = default.lower() not in ("0", "false", "no", "")
         if required and default is not None:
             required = False
         if "choices" in kwargs:
@@ -198,6 +200,24 @@ class Config(metaclass=CacheMeta):
             default=False,
             type=bool,
             help=("Record to csv file"),
+        )
+        parser.add_argument(
+            "--cudagraph",
+            envvar="CUDAGRAPH",
+            action=FromEnvironment,
+            required=False,
+            default=False,
+            type=bool,
+            help=("Use cudagraph"),
+        )
+        parser.add_argument(
+            "--cupti",
+            envvar="CUPTI",
+            action=FromEnvironment,
+            required=False,
+            default=True,
+            type=bool,
+            help=("Use CUPTI (torch.profiler) for kernel profiling instead of CUDA Events"),
         )
         parser.add_argument(
             "--file",

@@ -32,7 +32,7 @@ def get_apply_rope_func(model: str = "llama"):
     Returns a callable that applies Rotary Position Embedding (RoPE) for a given model variant.
 
     Args:
-        model: Model name that determines the RoPE layout transformation. Supported: 'llama', 'qwen2', 'deepseek'
+        model: Model name that determines the RoPE layout transformation. Supported: 'llama', 'qwen2', 'qwen3_5', 'deepseek'
 
     Returns:
         Callable implementing RoPE application with signature similar to `apply_rope_base`
@@ -51,6 +51,7 @@ def apply_rope_base(
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
     use_tma: bool = False,
+    partial_rotary_factor: float = 1.0,
 ):
     """
     Applies Rotary Position Embedding (RoPE) to query and key tensors.
@@ -58,11 +59,16 @@ def apply_rope_base(
     Args:
         q: Query tensor of shape (B, H_q, S, D)
         k: Key tensor of shape (B, H_kv, S, D)
-        cos: Cosine tensor of shape (1, S, D) or (B, S, D)
-        sin: Sine tensor with the same shape as `cos`
+        cos: Cosine tensor of shape (1, S, D) or (B, S, D).
+             When ``partial_rotary_factor < 1.0``, D equals ``int(head_dim * partial_rotary_factor)``
+             (i.e. ``rope_dim``), not ``head_dim``.
+        sin: Sine tensor with the same shape as ``cos``
         position_ids: Optional - Position IDs tensor, default None
         unsqueeze_dim: Optional - Dimension to unsqueeze, default 1
         use_tma: Whether to use TMA optimized path when available
+        partial_rotary_factor: Fraction of head dimensions to rotate (default 1.0 = full RoPE).
+            When < 1.0, only the first ``int(head_dim * partial_rotary_factor)`` dimensions
+            are rotated; the rest pass through unchanged.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Query and key tensor pair with RoPE applied
@@ -132,7 +138,7 @@ def rms_norm(
     weight: torch.Tensor,
     eps: float,
     bias: Optional[torch.Tensor] = None,
-    static_persistent: bool = False,
+    mode: Optional[str] = None,
     **kwargs: Any,
 ):
     """
@@ -144,7 +150,7 @@ def rms_norm(
         weight: Tensor of shape (N,)
         eps: small scaler to be added to variance calculation prior to division.
         bias: Bias tensor of shape (N,), default is None
-        static_persistent: Whether to use static persistent kernel, default is False
+        mode: Kernel selection mode (None, "static_persistent", "multi_wave_reload", "multi_wave_cached")
         **kwargs: Additional arguments for backend-specific configurations
     """
     raise NotImplementedError(f"rms_norm is not implemented for {get_current_backend()}")
@@ -949,3 +955,41 @@ def chunk_gated_delta_rule(
         Tuple[torch.Tensor, Optional[torch.Tensor]]: output (B, T, H, V), final_state
     """
     raise NotImplementedError(f"chunk_gated_delta_rule is not implemented for {get_current_backend()}")
+
+
+@dispatch(
+    "swa_attention",
+)
+def swa_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_size: int,
+    scaling: Optional[float] = None,
+    is_causal: bool = True,
+    **kwargs: Any,
+):
+    """
+    Sliding window attention (SWA) forward pass.
+
+    Computes causal attention where each query attends to at most ``window_size``
+    preceding keys. Uses online softmax with exp2 + flush-to-zero for efficient
+    SFU utilization on NVIDIA GPUs.
+
+    Supports grouped-query attention (GQA): when ``k``/``v`` have fewer heads than
+    ``q``, KV heads are expanded automatically via ``repeat_interleave``.
+
+    Args:
+        q: Query tensor of shape (B, H, S_Q, D), fp16
+        k: Key tensor of shape (B, H_K, S_K, D), fp16
+        v: Value tensor of shape (B, H_K, S_K, D), fp16
+        window_size: Number of preceding keys each query can attend to.
+            When window_size >= S_K, equivalent to full causal attention.
+        scaling: QK scaling factor, defaults to 1/sqrt(D)
+        is_causal: Whether to apply causal masking (default: True)
+        **kwargs: Additional backend-specific arguments
+
+    Returns:
+        Output tensor of shape (B, H, S_Q, D), fp16
+    """
+    raise NotImplementedError(f"swa_attention is not implemented for {get_current_backend()}")

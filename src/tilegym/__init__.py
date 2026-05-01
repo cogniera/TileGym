@@ -17,24 +17,23 @@ def _check_torch_dependencies():
         ) from None
 
 
-def _check_ct_experimental_dependency():
-    """Verify that cuda-tile-experimental is installed with helpful error message."""
+def _check_ct_tune_dependency():
+    """Verify that cuda-tile with tune support is installed with helpful error message."""
     try:
-        import cuda.tile_experimental  # noqa: F401
+        import cuda.tile.tune  # noqa: F401
     except (ImportError, ModuleNotFoundError):
         raise ImportError(
-            "\n\n[TileGym] cuda-tile-experimental is required but not installed.\n"
-            "It is not available on PyPI and must be installed from source:\n\n"
-            '  pip install "cuda-tile-experimental @ '
-            'git+https://github.com/NVIDIA/cutile-python.git#subdirectory=experimental"\n\n'
-            "See: https://github.com/NVIDIA/cutile-python?tab=readme-ov-file"
-            "#experimental-features-optional\n"
+            "\n\n[TileGym] cuda.tile.tune is required but not available.\n"
+            "Please install or upgrade cuda-tile:\n\n"
+            "  pip install cuda-tile\n\n"
+            "See: https://github.com/NVIDIA/cutile-python"
         ) from None
 
 
 # Check dependencies before any imports
 _check_torch_dependencies()
-_check_ct_experimental_dependency()
+
+import torch
 
 # Import logging utilities
 from .logger import get_logger
@@ -55,6 +54,7 @@ from .backend import set_backend
 
 # Setup cutile integration
 if is_backend_available("cutile"):
+    _check_ct_tune_dependency()
     # Apply experimental kernel tracking patch
     from .experimental import _apply_patch as _apply_experimental_patch
 
@@ -86,7 +86,7 @@ __all__ = [
 ]
 
 # Version info
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import contextlib
 from enum import Enum

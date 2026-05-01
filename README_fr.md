@@ -31,10 +31,10 @@ Ce dépôt vise à fournir des tutoriels et des exemples de noyaux utiles pour l
 
 ### Prérequis
 
-> ⚠️ **Important** : TileGym nécessite **CUDA 13.1** et des **GPU d'architecture NVIDIA Blackwell** (par ex. B200, RTX 5080, RTX 5090). Nous prendrons en charge d'autres architectures GPU à l'avenir. Téléchargez CUDA depuis [Téléchargements NVIDIA CUDA](https://developer.nvidia.com/cuda-downloads).
+> **Support GPU** : TileGym nécessite **CUDA 13.1+** et un **GPU Blackwell** (ex. B200, RTX 5080, RTX 5090). Les **GPU NVIDIA Ampere** (ex. A100) sont également supportés avec **CUDA 13.2+**. Tous les noyaux cuTile publiés sont validés sur les deux architectures. Téléchargez CUDA depuis [Téléchargements NVIDIA CUDA](https://developer.nvidia.com/cuda-downloads).
 
 - PyTorch (version 2.9.1 ou compatible)
-- **[CUDA 13.1](https://developer.nvidia.com/cuda-downloads)** (Requis - TileGym est construit et testé exclusivement sur CUDA 13.1)
+- **[CUDA 13.1+](https://developer.nvidia.com/cuda-downloads)** (Requis - TileGym est construit et testé exclusivement sur CUDA 13.1+)
 - Triton (inclus avec l'installation de PyTorch)
 
 ### Étapes d'installation
@@ -51,18 +51,33 @@ Nous avons vérifié que `torch==2.9.1` fonctionne. Vous pouvez également obten
 
 #### 2. Installer TileGym
 
+TileGym utilise [`cuda-tile`](https://github.com/nvidia/cutile-python) (≥ 1.3.0) pour la programmation de noyaux GPU, qui dépend du compilateur `tileiras` à l'exécution.
+
+##### Installer depuis PyPI (recommandé)
+
 ```bash
-git clone <tilegym-repository-url>
-cd tilegym
-pip install -r requirements.txt
-pip install .
+pip install tilegym[tileiras]
 ```
 
-Toutes les dépendances d'exécution sont déclarées dans [`requirements.txt`](requirements.txt). L'exécution de `pip install .` les installe également automatiquement, mais vous pouvez les pré-installer explicitement avec `pip install -r requirements.txt`.
+Ceci installe TileGym et toutes les dépendances d'exécution, y compris `cuda-tile[tileiras]` qui intègre le compilateur `tileiras` directement dans votre environnement Python.
 
-Cela installera automatiquement `cuda-tile`, voir https://github.com/nvidia/cutile-python.
+Si `tileiras` est déjà disponible sur votre système (par ex. depuis [CUDA Toolkit 13.1+](https://developer.nvidia.com/cuda-downloads)), vous pouvez omettre l'extra :
 
-Si vous souhaitez utiliser le mode édition pour `TileGym`, exécutez `pip install -e .`
+```bash
+pip install tilegym
+```
+
+##### Installer depuis les sources
+
+```bash
+git clone https://github.com/NVIDIA/TileGym.git
+cd TileGym
+pip install .[tileiras]   # ou : pip install .  (si vous avez tileiras sur votre système)
+```
+
+Pour le mode éditable (développement), utilisez `pip install -e .` ou `pip install -e .[tileiras]`.
+
+Toutes les dépendances d'exécution sont déclarées dans [`requirements.txt`](requirements.txt) et sont installées automatiquement par `pip install tilegym` et `pip install .`.
 
 Nous fournissons également un Dockerfile, vous pouvez consulter [modeling/transformers/README.md](modeling/transformers/README.md).
 

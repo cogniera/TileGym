@@ -2,6 +2,14 @@
 name: converting-cutile-to-julia
 description: Converts cuTile Python GPU kernels (@ct.kernel) to cuTile.jl Julia equivalents. Handles kernel syntax translation, 0-indexed to 1-indexed conversion, broadcasting differences, memory layout (row-major to column-major), type system mapping, and launch API differences. Use when converting, porting, or translating cuTile Python kernels to Julia cuTile.jl, or debugging/optimizing existing Julia cuTile translations.
 license: MIT. Complete terms in LICENSE.
+metadata:
+  author: "TileGym Team <TileGym@nvidia.com>"
+  tags:
+    - cutile
+    - julia
+    - conversion
+    - gpu
+    - kernel
 ---
 
 # cuTile Python → cuTile.jl (Julia) Conversion
@@ -25,7 +33,7 @@ julia/                          # Self-contained Julia sub-project
 ├── Project.toml                # Dependencies: CUDA.jl, cuTile.jl, NNlib.jl, Test
 ├── kernels/                    # cuTile.jl kernel implementations
 │   ├── add.jl                  # ← Ground-truth: 1D element-wise with alpha scaling (tensor+tensor, tensor+scalar)
-│   ├── matmul.jl               # ← Ground-truth: 2D tiled MMA, column-major layout (K,M)×(N,K)→(N,M)
+│   ├── matmul.jl               # ← Ground-truth: 2D tiled MMA, standard Julia layout (M,K)×(K,N)→(M,N)
 │   └── softmax.jl              # ← Ground-truth: 3 strategies (TMA, online, chunked) using ct.load/ct.store
 └── test/                       # Julia-native tests (using Test stdlib)
     ├── runtests.jl             # Test runner entry point
@@ -36,7 +44,7 @@ julia/                          # Self-contained Julia sub-project
 
 **Ground-truth reference**: Always consult `julia/kernels/*.jl` and `julia/test/*.jl` for patterns that compile and pass tests. These are the canonical examples of working cuTile.jl code.
 
-## Quick Steps
+## Instructions
 
 1. **Analyze** the Python kernel: identify patterns, shapes, dtypes, operations
 2. **Write Julia kernel** — `julia/kernels/<op>.jl` with cuTile.jl kernel + bridge function(s)
@@ -55,9 +63,9 @@ The most dangerous translation errors. Full rules (17 total) in [`references/cri
 
 | # | Pitfall | One-line fix |
 |---|---------|-------------|
-| 1 | `for` loops crash the compiler | Use `while` + `Int32` counter |
+| 1 | `ct.full()` doesn't exist in Julia | Use `fill(val, shape)`, `zeros(T, dims...)`, or `ones(T, dims...)` |
 | 2 | `max(a, b)` on tiles → `IRError` | Use `max.(a, b)` (broadcast dot) |
-| 3 | `Int32(runtime_val)` → `MethodError` | Use `ct.full((N,), val, Int32)` instead |
+| 3 | `IRError` / `MethodError` mentioning `IRStructurizer` | Compiler bug — file upstream with minimal reproducer |
 | 4 | `ct.launch` arg order silently wrong | Args are positional — match kernel signature exactly |
 | 5 | `ct.load` with `order` — index positions wrong | `order` remaps BOTH shape AND index (Critical Rule 16) |
 
@@ -67,9 +75,9 @@ Side-by-side Python → Julia conversions matching the released Julia kernels in
 
 | # | Example | Key Patterns | When to Reference |
 |---|---------|-------------|-------------------|
-| 01 | [`add`](examples/01_add/) | 1D `ct.load`/`ct.store`, alpha scaling, `ct.full`, broadcast `.+`/`.*` | Starting point; basic TMA + element-wise patterns |
-| 02 | [`matmul`](examples/02_matmul/) | `muladd`, TF32 conversion, K-loop with `while`, column-major layout | MMA / tensor core operations |
-| 03 | [`softmax`](examples/03_softmax/) | Persistent scheduling, column-chunked `ct.load`/`ct.store`, multi-pass | Large-tensor reduction patterns |
+| 01 | [`add`](examples/01_add/) | 1D `ct.load`/`ct.store`, alpha scaling, scalar broadcast, `fill`/`zeros`, keyword load/store | Starting point; basic TMA + element-wise patterns |
+| 02 | [`matmul`](examples/02_matmul/) | `muladd`, TF32 conversion, K-loop with `for`, 2D swizzle, standard Julia layout, `ct.@compiler_options` | MMA / tensor core operations |
+| 03 | [`softmax`](examples/03_softmax/) | Persistent scheduling, `for` loops, `gather`/`scatter`, `padding_mode`, multi-pass | Large-tensor reduction patterns |
 
 These match the released kernels in `julia/kernels/` (`add.jl`, `matmul.jl`, `softmax.jl`). The examples are simplified teaching versions — always consult `julia/kernels/*.jl` for the canonical, tested implementations.
 
@@ -87,11 +95,12 @@ These match the released kernels in `julia/kernels/` (`add.jl`, `matmul.jl`, `so
 
 ## Environment Setup
 
-```bash
-# Install Julia (if not already installed)
-curl -fsSL https://install.julialang.org | sh
+**Prerequisite — Julia**: this skill requires the Julia version declared in `julia/Project.toml` under `[compat] julia`. If `julia --version` is missing or older than that, install from the official Julia site at <https://julialang.org/install/> following the verified installer instructions for your OS. Resume below once `julia --version` is compatible.
 
-# Install dependencies (from repo root, requires Julia 1.12+)
+Then, from the repo root:
+
+```bash
+# Install Julia dependencies declared in julia/Project.toml
 julia --project=julia/ -e 'using Pkg; Pkg.instantiate()'
 
 # Run tests
@@ -99,7 +108,7 @@ julia --project=julia/ julia/test/runtests.jl
 ```
 
 Requirements:
-- Julia 1.12+
+- Julia (minimum version declared in `julia/Project.toml` under `[compat] julia`)
 - CUDA 13.1+ driver
 - Blackwell GPU (compute capability 10+)
 - Dependencies managed via `julia/Project.toml`: CUDA.jl, cuTile.jl, NNlib.jl, Test

@@ -16,6 +16,7 @@ class Test_Softmax(common.PyTestCase):
         return torch.nn.functional.softmax(x, dim=-1)
 
     _backends = ["cutile"]
+    _perf_frameworks = _backends + ["pytorch"]
 
     @pytest.mark.parametrize(
         "m,n,dtype",
@@ -40,6 +41,7 @@ class Test_Softmax(common.PyTestCase):
         else:
             pytest.skip(f"Backend {backend} is not available")
 
+        self.setUp()
         device = torch.device("cuda")
         x = torch.rand(
             m,

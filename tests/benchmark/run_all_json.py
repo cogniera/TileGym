@@ -12,6 +12,7 @@ results in JSON format for easier processing and regression detection.
 
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -198,7 +199,7 @@ def run_benchmark(benchmark_file: Path) -> Dict[str, Any]:
             [sys.executable, str(benchmark_file)],
             capture_output=True,
             text=True,
-            timeout=600,  # 10 minute timeout per benchmark
+            timeout=1200,  # 20 minute timeout per benchmark
             cwd=benchmark_file.parent,
         )
 
@@ -231,8 +232,8 @@ def run_benchmark(benchmark_file: Path) -> Dict[str, Any]:
             "benchmark_file": benchmark_file.name,
             "status": "TIMEOUT",
             "error_type": "TimeoutError",
-            "error_message": "Benchmark exceeded 10 minute timeout",
-            "error": "Benchmark exceeded 10 minute timeout",
+            "error_message": "Benchmark exceeded 20 minute timeout",
+            "error": "Benchmark exceeded 20 minute timeout",
             "benchmarks": [],
         }
     except Exception as e:
@@ -255,9 +256,9 @@ def setup_output_directory() -> Path:
 
 
 def find_benchmark_files() -> List[Path]:
-    """Find all benchmark files in the current directory."""
+    """Find all benchmark files recursively under the benchmark directory."""
     benchmark_dir = Path(__file__).parent
-    benchmark_files = sorted(benchmark_dir.glob("bench_*.py")) + sorted(benchmark_dir.glob("experimental/bench_*.py"))
+    benchmark_files = sorted(benchmark_dir.rglob("bench_*.py"))
 
     if not benchmark_files:
         logger.error("No benchmark files found")
@@ -274,17 +275,22 @@ def run_all_benchmarks(benchmark_files: List[Path], output_dir: Path) -> Tuple[D
     }
 
     failed_benchmarks = []
+    benchmark_dir = Path(__file__).parent
 
     for bench_file in benchmark_files:
+        rel_path = bench_file.relative_to(benchmark_dir)
+        safe_name = str(rel_path).replace(os.sep, "_").replace(".py", "")
+
         logger.info("=" * 60)
-        logger.info(f"Running {bench_file.name}...")
+        logger.info(f"Running {rel_path}...")
         logger.info("=" * 60)
 
         result = run_benchmark(bench_file)
+        result["benchmark_file"] = str(rel_path)
         all_results["benchmarks"].append(result)
 
         # Save individual result file
-        output_file = output_dir / f"{bench_file.stem}_results.json"
+        output_file = output_dir / f"{safe_name}_results.json"
         with open(output_file, "w") as f:
             json.dump(result, f, indent=2)
 
@@ -293,12 +299,12 @@ def run_all_benchmarks(benchmark_files: List[Path], output_dir: Path) -> Tuple[D
 
         # Log status
         if result["status"] == "PASSED":
-            logger.info(f"✓ PASSED: {bench_file.name}")
+            logger.info(f"✓ PASSED: {rel_path}")
             logger.info(f"  Results saved to: {output_file}")
         else:
-            logger.error(f"✗ FAILED: {bench_file.name}")
+            logger.error(f"✗ FAILED: {rel_path}")
             logger.info(f"  Error details saved to: {output_file}")
-            failed_benchmarks.append(bench_file.name)
+            failed_benchmarks.append(str(rel_path))
             # Log error preview (first 5 lines)
             error_lines = result.get("error", "Unknown error").split("\n")
             for line in error_lines[:5]:
